@@ -149,6 +149,10 @@ def create_app(
     def restore_node(node_id: str) -> dict[str, Any]:
         return service.restore_node(database, node_id)
 
+    @app.post("/api/nodes/{node_id}/abort")
+    def abort_drain(node_id: str) -> dict[str, Any]:
+        return service.abort_drain(database, node_id)
+
     @app.post("/api/migrations/{migration_id}/resolve")
     def resolve_migration(
         migration_id: int, request: ResolveRequest

@@ -29,6 +29,7 @@ DATABASE_PATH=./data/rehearsal.db SEED_TOPOLOGY=./examples/cluster.json \
 4. 「受阻容器」面板列出旧副本仍在服务的容器及原因；修正容量后点节点上的「继续」重试。
 5. 节点上没有任何服务副本后才会显示「已空」；进度条与“节点上剩余副本”分开统计，未就绪的新副本不计入业务就绪数。
 6. 演练后点「恢复」可把已空节点放回可用池，便于反复演练。
+7. 检修取消时点「中止」：已切换的副本保留在目标节点，未就绪的新副本取消并释放预留，旧副本继续服务，节点立即恢复可用；中止记录留在排空历史里。
 
 ## JSON 格式
 
@@ -62,6 +63,7 @@ DATABASE_PATH=./data/rehearsal.db SEED_TOPOLOGY=./examples/cluster.json \
 | POST | `/api/nodes/{node_id}/drain` | 发起排空 |
 | POST | `/api/nodes/{node_id}/resume` | 重试未完成排空的受阻副本 |
 | POST | `/api/nodes/{node_id}/restore` | 把已空节点恢复为可用 |
+| POST | `/api/nodes/{node_id}/abort` | 中止未完成的排空：取消启动中新副本、释放预留、节点恢复可用 |
 | POST | `/api/migrations/{migration_id}/resolve` | `{"outcome":"ready"\|"failed","reason":"..."}` |
 | GET | `/api/drains/{drain_id}` | 单个排空任务进度 |
 | GET | `/healthz` | 健康检查 |
@@ -74,6 +76,7 @@ DATABASE_PATH=./data/rehearsal.db SEED_TOPOLOGY=./examples/cluster.json \
 - **先预留后切换**：`drain` 在同一事务内挑选目标并写入 `starting` 预留；`resolve ready` 在同一事务内把新副本落到目标并移走旧副本，就绪数不会中途下跌。
 - **不重复占容量**：所有写操作走 SQLite `BEGIN IMMEDIATE`，在锁内重新读取节点用量；两个并发排空不会对同一空闲容量各预留一次。
 - **失败/无落点**：预留释放，旧副本继续服务，容器进入受阻列表（`INSUFFICIENT_CAPACITY` / `NO_USABLE_TARGET` / `REPLICA_START_FAILED`）。
+- **中止排空**：`abort` 在同一事务内把该排空所有启动中的新副本标记为 `cancelled` 并释放其预留；已切换副本及目标节点占用保留，未切换的旧副本继续服务，源节点立即恢复 `ready`。中止与另一实例的「新副本就绪」交错时以先提交者为准（写锁串行化 + 状态校验）：中止先提交则迟到的就绪返回 409 不再切换；就绪先提交则该副本保持已切换，中止只取消其余启动中的副本。释放的容量立即可供其他排空使用；再次排空源节点按当前副本位置和容量重新安排。已迁移（`completed`）与已取消（`cancelled`）的尝试都留在该排空的尝试记录里，重启后仍可在历史与 `GET /api/drains/{id}` 查看。
 - **自上而下**：正在排空或已空的节点不会成为目标；有入库预留的节点不允许被发起排空，直到这些新副本被决策。
 - **重启续作**：所有状态都在 SQLite 中，启动时只做派生状态校正（`reconcile`），不重放、不丢失预留；未完成排空显示“未完成”并带「继续」入口。
 - **节点已空**：仅当节点没有任何服务副本、没有预留、且排空已完成时才为 `drained`，前端 `is_empty` 同样由事实推导。
@@ -85,4 +88,4 @@ python3 -m pip install -r requirements.txt pytest httpx
 python3 -m pytest tests -q
 ```
 
-`tests/test_flow.py` 覆盖：导入校验、预留与就绪口径、成功切换、启动失败保底、无可行落点、并发排空不超额、重启续作、未完成排空不误报“已空”、受阻重试、已空节点恢复。
+`tests/test_flow.py` 覆盖：导入校验、预留与就绪口径、成功切换、启动失败保底、无可行落点、并发排空不超额、重启续作、未完成排空不误报“已空”、受阻重试、已空节点恢复、中止排空（保留已切换/释放预留/记录已取消）、中止与就绪交错时先提交者生效、中止容量被其他排空复用、中止后再次排空重新安排、旧版本数据库的约束迁移。

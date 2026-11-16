@@ -187,32 +187,38 @@ def _drain_public(
     latest = _latest_attempts(conn, drain["id"])
     serving = _serving_containers(conn, node_id)
 
-    # Progress is measured against every logical container this drain has ever
-    # tried to move, plus anything still serving on the node. Unfinished
-    # replicas therefore never inflate the number.
-    tracked_ids: set[str] = set(latest)
-    tracked_ids.update(container["id"] for container in serving)
-    total = len(tracked_ids)
-    # A completed attempt only counts once its replica actually left this
-    # node; a later drain may have placed it back.
-    placed_elsewhere = {
-        row["id"]
-        for row in conn.execute(
-            "SELECT id FROM containers WHERE node_id != ?", (node_id,)
-        ).fetchall()
-    }
-    moved = sum(
-        1
-        for row in latest.values()
-        if row["state"] == "completed" and row["container_id"] in placed_elsewhere
-    )
-    if drain["status"] == "completed":
-        # History is frozen at completion; later drains moving replicas back
-        # must not rewrite an old drain's result.
-        moved = total
+    if drain["status"] in ("completed", "cancelled"):
+        # Closed drains are frozen history: only count what this drain itself
+        # attempted, so replicas later landing on or leaving the node cannot
+        # rewrite its result. Attempt rows are never updated once closed, so
+        # the counts survive restarts and later drains verbatim.
+        total = len(latest)
+        moved = sum(1 for row in latest.values() if row["state"] == "completed")
+    else:
+        # Progress is measured against every logical container this drain has
+        # ever tried to move, plus anything still serving on the node.
+        # Unfinished replicas therefore never inflate the number.
+        tracked_ids: set[str] = set(latest)
+        tracked_ids.update(container["id"] for container in serving)
+        total = len(tracked_ids)
+        # A completed attempt only counts once its replica actually left this
+        # node; a later drain may have placed it back.
+        placed_elsewhere = {
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM containers WHERE node_id != ?", (node_id,)
+            ).fetchall()
+        }
+        moved = sum(
+            1
+            for row in latest.values()
+            if row["state"] == "completed"
+            and row["container_id"] in placed_elsewhere
+        )
     pending = [row for row in attempts if row["state"] == "starting"]
     failed = [row for row in latest.values() if row["state"] == "failed"]
     blocked = [row for row in latest.values() if row["state"] == "blocked"]
+    cancelled = [row for row in latest.values() if row["state"] == "cancelled"]
 
     return {
         "id": drain["id"],
@@ -227,6 +233,7 @@ def _drain_public(
         "starting": len(pending),
         "failed": len(failed),
         "blocked": len(blocked),
+        "cancelled": len(cancelled),
         "progress_percent": round((moved / total) * 100, 1) if total else 100.0,
         "pending_decisions": [_public_migration(row) for row in pending],
         "attempts": [_public_migration(row) for row in attempts],
@@ -338,6 +345,7 @@ def snapshot(db: Database) -> dict[str, Any]:
                         and drain["status"] == "incomplete"
                         and not inbound
                     ),
+                    "can_abort": drain is not None,
                     "can_restore": (
                         node["status"] == "drained"
                         and not serving_here
@@ -820,6 +828,52 @@ def get_drain(db: Database, drain_id: int) -> dict[str, Any]:
         if drain is None:
             raise ApiError(404, "DRAIN_NOT_FOUND", f"drain {drain_id} does not exist")
         return _drain_public(conn, drain)
+
+
+def abort_drain(db: Database, node_id: str) -> dict[str, Any]:
+    """Call off an open drain mid-flight.
+
+    In one write-locked transaction: replicas that already cut over keep
+    their new placement and the target node's capacity; every still-starting
+    replica is marked ``cancelled`` so its reservation is released for other
+    drains; the old replicas of those cancelled attempts never stopped
+    serving, so the source node simply rejoins the usable pool. Because the
+    abort commits inside the same ``BEGIN IMMEDIATE`` serialisation as
+    ``resolve_migration``, whichever operation commits first wins: a late
+    "replica ready" arrives after the migration left ``starting`` and is
+    rejected with 409 instead of cutting over.
+    """
+    with db.write() as conn:
+        node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if node is None:
+            raise ApiError(404, "NODE_NOT_FOUND", f"node {node_id!r} does not exist")
+        drain = _open_drain_for_node(conn, node_id)
+        if drain is None:
+            raise ApiError(
+                409, "NO_OPEN_DRAIN", f"node {node_id!r} has no open drain to abort"
+            )
+        now = utcnow()
+        # Release the reservations of not-yet-ready replicas. Completed
+        # attempts are untouched: their cutover already happened and their
+        # target nodes keep the capacity those replicas now use.
+        conn.execute(
+            "UPDATE migrations SET state = 'cancelled', "
+            "error_code = 'DRAIN_ABORTED', error = ?, updated_at = ? "
+            "WHERE drain_id = ? AND state = 'starting'",
+            (
+                "drain aborted; reservation released, old replica keeps serving",
+                now,
+                drain["id"],
+            ),
+        )
+        conn.execute(
+            "UPDATE drains SET status = 'cancelled', finished_at = ? WHERE id = ?",
+            (now, drain["id"]),
+        )
+        # Maintenance is called off: the node is usable again and may host
+        # replicas or be drained afresh from the current placements.
+        conn.execute("UPDATE nodes SET status = 'ready' WHERE id = ?", (node_id,))
+    return snapshot(db)
 
 
 def restore_node(db: Database, node_id: str) -> dict[str, Any]:

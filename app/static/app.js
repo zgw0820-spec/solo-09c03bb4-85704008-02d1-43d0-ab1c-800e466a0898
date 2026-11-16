@@ -41,6 +41,7 @@ const STATUS_LABELS = {
   blocked: "受阻",
   active: "进行中",
   incomplete: "未完成",
+  cancelled: "已中止",
 };
 
 const REASON_LABELS = {
@@ -48,6 +49,7 @@ const REASON_LABELS = {
   NO_USABLE_TARGET: "没有可用目标节点",
   REPLICA_START_FAILED: "新副本模拟启动失败",
   RESERVATION_LOST: "目标容量预留失效",
+  DRAIN_ABORTED: "排空已中止，预留已释放",
 };
 
 function escapeHtml(value) {
@@ -252,6 +254,7 @@ function renderNodes(data) {
       const canDrain = node.can_drain && !STATE.busy;
       const canResume = node.can_resume && !STATE.busy;
       const canRestore = node.can_restore && !STATE.busy;
+      const canAbort = node.can_abort && !STATE.busy;
       const inbound = node.inbound_reservations.length;
       const statusChip = node.is_empty
         ? `<span class="badge drained">已空</span>`
@@ -271,6 +274,8 @@ function renderNodes(data) {
                 ${canResume ? "" : "disabled"} title="重试受阻容器">继续</button>
               <button class="btn small ghost" data-action="restore" data-node-id="${escapeHtml(node.id)}"
                 ${canRestore ? "" : "disabled"} title="把已排空节点恢复为可用，便于再次演练">恢复</button>
+              <button class="btn small danger" data-action="abort" data-node-id="${escapeHtml(node.id)}"
+                ${canAbort ? "" : "disabled"} title="取消未就绪的新副本并释放预留，已切换副本保留，节点恢复可用">中止</button>
             </div>
           </div>
           ${capacityBar(node)}
@@ -361,15 +366,25 @@ function renderDrains(data) {
   const hint = $("drain-hint");
 
   if (!drains.length) {
-    const completed = data.drains.find((d) => d.status === "completed");
+    const closed = data.drains.find(
+      (d) => d.status === "completed" || d.status === "cancelled"
+    );
     hint.textContent = "选择左侧节点发起排空";
-    host.innerHTML = completed
-      ? `<p class="empty">当前没有进行中的排空。最近完成：节点 <b>${escapeHtml(
-          completed.node_name
-        )}</b>（#${completed.id}，迁移 ${completed.moved} 个副本，结束于 ${escapeHtml(
-          completed.finished_at || ""
-        )}）。</p>`
-      : `<p class="empty">尚未发起排空。选择节点后点击“排空”，系统会先预留目标容量，再推进新副本就绪。</p>`;
+    if (!closed) {
+      host.innerHTML = `<p class="empty">尚未发起排空。选择节点后点击“排空”，系统会先预留目标容量，再推进新副本就绪。</p>`;
+    } else if (closed.status === "cancelled") {
+      host.innerHTML = `<p class="empty">当前没有进行中的排空。最近中止：节点 <b>${escapeHtml(
+        closed.node_name
+      )}</b>（#${closed.id}，已迁移 ${closed.moved} 个、已取消 ${closed.cancelled} 个尝试，节点上剩 ${closed.remaining_on_node} 个副本继续服务，结束于 ${escapeHtml(
+        closed.finished_at || ""
+      )}）。</p>`;
+    } else {
+      host.innerHTML = `<p class="empty">当前没有进行中的排空。最近完成：节点 <b>${escapeHtml(
+        closed.node_name
+      )}</b>（#${closed.id}，迁移 ${closed.moved} 个副本，结束于 ${escapeHtml(
+        closed.finished_at || ""
+      )}）。</p>`;
+    }
     return;
   }
 
@@ -388,13 +403,18 @@ function renderDrains(data) {
         <div class="drain-block" data-drain="${drain.id}">
           <div class="row" style="justify-content:space-between;gap:10px;flex-wrap:wrap">
             <div><b>排空 #${drain.id} · ${escapeHtml(drain.node_name)}</b> ${statusBadge(drain.status)}</div>
-            <div class="hint">开始于 ${escapeHtml(drain.created_at)}</div>
+            <div class="row gap" style="margin:0">
+              <span class="hint">开始于 ${escapeHtml(drain.created_at)}</span>
+              <button class="btn small danger" data-action="abort" data-node-id="${escapeHtml(drain.node_id)}"
+                ${STATE.busy ? "disabled" : ""} title="取消未就绪的新副本并释放预留，已切换副本保留，节点恢复可用">中止排空</button>
+            </div>
           </div>
           <div class="drain-grid">
             <div class="stat"><div class="label">已迁移</div><div class="value">${drain.moved}<small> / ${drain.total}</small></div></div>
             <div class="stat"><div class="label">节点上剩余副本</div><div class="value">${drain.remaining_on_node}</div></div>
             <div class="stat"><div class="label">启动中新副本</div><div class="value">${drain.starting}</div></div>
             <div class="stat"><div class="label">受阻 / 失败</div><div class="value">${drain.blocked + drain.failed}</div></div>
+            <div class="stat"><div class="label">已取消</div><div class="value">${drain.cancelled}</div></div>
           </div>
           <div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
             <div style="width:${pct}%"></div>
@@ -499,7 +519,7 @@ function renderHistory(data) {
   const drains = data.drains || [];
   $("history-count").textContent = drains.length ? `最近 ${drains.length} 条` : "";
   if (!drains.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty-cell">暂无记录</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" class="empty-cell">暂无记录</td></tr>`;
     return;
   }
   body.innerHTML = drains
@@ -510,6 +530,7 @@ function renderHistory(data) {
         <td>${statusBadge(drain.status)}</td>
         <td>${drain.moved}/${drain.total} · ${drain.progress_percent}%</td>
         <td>${drain.starting}</td>
+        <td>${drain.cancelled || "—"}</td>
         <td class="hint">${escapeHtml(drain.created_at)}</td>
         <td class="hint">${escapeHtml(drain.finished_at || "—")}</td>
       </tr>`)
@@ -669,6 +690,33 @@ function wireActions() {
       const nodeId = button.dataset.nodeId;
       const data = await mutate(`/api/nodes/${encodeURIComponent(nodeId)}/restore`);
       if (data) toast("节点已恢复可用", "ok");
+      return;
+    }
+
+    if (action === "abort") {
+      const nodeId = button.dataset.nodeId;
+      const node = STATE.data?.nodes.find((n) => n.id === nodeId);
+      const drain = node?.drain;
+      const detail = drain
+        ? `排空 #${drain.id}（已迁移 ${drain.moved} 个，${drain.starting} 个新副本启动中）`
+        : "该节点的排空";
+      const ok = window.confirm(
+        `确定中止${detail}？\n` +
+          "· 未就绪的新副本将被取消，预留在目标节点的容量立即释放；\n" +
+          "· 已切换的副本保留在目标节点，未切换的旧副本继续在本节点服务；\n" +
+          "· 节点恢复可用，可再次排空（按当前位置和容量重新安排）。"
+      );
+      if (!ok) return;
+      const data = await mutate(`/api/nodes/${encodeURIComponent(nodeId)}/abort`);
+      if (data) {
+        const record = data.drains.find((d) => d.node_id === nodeId && d.status === "cancelled");
+        toast(
+          record
+            ? `排空已中止：已迁移 ${record.moved} 个、已取消 ${record.cancelled} 个尝试，节点恢复可用`
+            : "排空已中止，节点恢复可用",
+          "ok"
+        );
+      }
       return;
     }
 

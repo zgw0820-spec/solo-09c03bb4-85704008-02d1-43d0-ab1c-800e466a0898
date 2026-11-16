@@ -62,6 +62,82 @@ def test_two_nodes_drained_at_the_same_time_never_overcommit(tmp_path):
     assert sum(node["reserved_cpu"] for node in state["nodes"]) == len(pending) * 3
 
 
+def test_abort_and_ready_race_first_commit_wins(tmp_path):
+    """An abort racing another instance's 'replica ready' is serialised by the
+    SQLite write lock: whichever commits first decides the outcome, and the
+    loser can no longer change replica placement."""
+    db = tmp_path / "abort-race.db"
+    payload = {
+        "nodes": [
+            {"id": "n1", "cpu_capacity": 8},
+            {"id": "n2", "cpu_capacity": 8},
+            {"id": "n3", "cpu_capacity": 8},
+        ],
+        "containers": [
+            {"id": "c1", "service": "s", "min_ready": 1, "node_id": "n1", "cpu_request": 2},
+            {"id": "c2", "service": "s", "min_ready": 1, "node_id": "n1", "cpu_request": 2},
+        ],
+    }
+    outcomes = set()
+    for _ in range(6):
+        with _client(db) as client:
+            assert client.post("/api/topology", json=payload).status_code == 200
+            state = client.post("/api/nodes/n1/drain").json()
+            mid = state["open_drains"][0]["pending_decisions"][0]["id"]
+            raced_container = state["open_drains"][0]["pending_decisions"][0][
+                "container_id"
+            ]
+
+        def abort() -> int:
+            with _client(db) as other:
+                return other.post("/api/nodes/n1/abort").status_code
+
+        def ready() -> int:
+            with _client(db) as other:
+                return other.post(
+                    f"/api/migrations/{mid}/resolve", json={"outcome": "ready"}
+                ).status_code
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = dict(zip(("abort", "ready"), pool.map(lambda f: f(), [abort, ready])))
+        assert results["abort"] == 200
+        assert results["ready"] in (200, 409)
+        outcomes.add(results["ready"])
+
+        with _client(db) as client:
+            state = client.get("/api/state").json()
+            drain = state["drains"][0]
+            assert drain["status"] == "cancelled"
+            assert state["open_drains"] == []
+            n1 = next(n for n in state["nodes"] if n["id"] == "n1")
+            assert n1["status"] == "ready"
+            raced = next(c for c in state["containers"] if c["id"] == raced_container)
+            other = next(c for c in state["containers"] if c["id"] != raced_container)
+            if results["ready"] == 200:
+                # Ready committed first: its cutover stands, the abort only
+                # cancelled the replica that was still starting.
+                assert raced["node_id"] != "n1"
+                assert drain["moved"] == 1
+                assert drain["cancelled"] == 1
+            else:
+                # Abort committed first: the late ready changed nothing.
+                assert raced["node_id"] == "n1"
+                assert drain["moved"] == 0
+                assert drain["cancelled"] == 2
+            # The replica that was still starting never left the source.
+            assert other["node_id"] == "n1"
+            # No reservation leaks in either interleaving.
+            assert all(n["reserved_cpu"] == 0 for n in state["nodes"])
+            for node in state["nodes"]:
+                assert node["used_cpu"] <= node["cpu_capacity"]
+            # A second, even later resolve is still refused.
+            late = client.post(f"/api/migrations/{mid}/resolve", json={"outcome": "ready"})
+            assert late.status_code == 409
+
+    # Both interleavings were exercised across the rounds.
+    assert outcomes == {200, 409}
+
+
 def _random_topology(rng: random.Random) -> dict:
     nodes = [
         {"id": f"n{i}", "cpu_capacity": rng.choice([4, 6, 8, 12])}
@@ -110,7 +186,9 @@ def test_random_workload_keeps_invariants(tmp_path, seed):
                 assert service["ready"] >= 0
                 assert service["starting_replicas"] >= 0
 
-            action = rng.choice(["drain", "resolve", "resolve", "resume", "restore"])
+            action = rng.choice(
+                ["drain", "resolve", "resolve", "resume", "restore", "abort"]
+            )
             if action == "drain":
                 candidates = [n["id"] for n in state["nodes"] if n["can_drain"]]
                 if candidates:
@@ -124,6 +202,11 @@ def test_random_workload_keeps_invariants(tmp_path, seed):
                 candidates = [n["id"] for n in state["nodes"] if n["can_restore"]]
                 if candidates:
                     response = client.post(f"/api/nodes/{rng.choice(candidates)}/restore")
+                    assert response.status_code == 200, response.text
+            elif action == "abort":
+                candidates = [n["id"] for n in state["nodes"] if n["can_abort"]]
+                if candidates:
+                    response = client.post(f"/api/nodes/{rng.choice(candidates)}/abort")
                     assert response.status_code == 200, response.text
             else:
                 pending = [

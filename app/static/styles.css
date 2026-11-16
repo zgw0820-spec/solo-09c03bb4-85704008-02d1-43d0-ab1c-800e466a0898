@@ -273,6 +273,7 @@ code { background: #0d1218; padding: 1px 5px; border-radius: 4px; }
 .badge.ready, .badge.serving, .badge.completed, .badge.drained { color: var(--ok); background: rgba(63, 191, 127, 0.12); border-color: rgba(63, 191, 127, 0.35); }
 .badge.draining, .badge.starting, .badge.active { color: var(--warn); background: rgba(240, 180, 41, 0.12); border-color: rgba(240, 180, 41, 0.35); }
 .badge.incomplete, .badge.blocked, .badge.failed { color: var(--danger); background: rgba(239, 95, 107, 0.12); border-color: rgba(239, 95, 107, 0.35); }
+.badge.cancelled { color: var(--muted); background: rgba(147, 164, 184, 0.12); border-color: rgba(147, 164, 184, 0.4); }
 .badge.reserved { color: var(--reserve); background: rgba(178, 132, 245, 0.14); border-color: rgba(178, 132, 245, 0.4); }
 
 .drain-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 12px 0; }
@@ -312,6 +313,7 @@ code { background: #0d1218; padding: 1px 5px; border-radius: 4px; }
 }
 .migration-card.starting { border-color: rgba(240, 180, 41, 0.5); }
 .migration-card.blocked, .migration-card.failed { border-color: rgba(239, 95, 107, 0.5); }
+.migration-card.cancelled { border-color: rgba(147, 164, 184, 0.45); opacity: 0.85; }
 .migration-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .migration-meta { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 10px; }
 .migration-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
